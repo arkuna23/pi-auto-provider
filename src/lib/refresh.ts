@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
+import { findBuiltinCandidate } from "./builtins.js";
 import { loadOverrideLayer, mergeOverrideLayers, writeJsonAtomic } from "./overrides.js";
 import { buildProviderModel } from "./params.js";
 import { fetchModelsDev } from "./models-dev.js";
@@ -61,6 +62,7 @@ export class AutoProviderManager {
       providerId: spec.id,
       modelCount: 0,
       cacheUpdated: 0,
+      officialFallbacks: 0,
       defaults: 0,
       ambiguities: [],
       errors: [],
@@ -174,6 +176,7 @@ export class AutoProviderManager {
       configs.push(result.config);
       runtime.push(result.runtime);
       if (result.report.defaults) report.defaults++;
+      if (result.report.officialFallback) report.officialFallbacks++;
       if (result.report.ambiguity) report.ambiguities.push(`${modelId}: ${result.report.ambiguity}`);
       if (result.report.sourceError) report.errors.push(`${modelId}: ${result.report.sourceError}`);
       if (result.catalogEntry) cacheUpdates.set(`${spec.id}/${modelId}`, result.catalogEntry);
@@ -235,7 +238,7 @@ function shouldLoadCatalog(
   if (force) return true;
   return ids.some((id) => {
     const key = `${spec.id}/${id}`;
-    const builtin = builtins.some((entry) => entry.model.id === id || entry.model.id.endsWith(`/${id}`));
+    const builtin = Boolean(findBuiltinCandidate(builtins, id, spec.id, { officialFallback: true }).model);
     const explicitSource = typeof user.get(key)?.source === "string" || typeof project.get(key)?.source === "string";
     return (!builtin && !cache.has(key)) || explicitSource;
   });

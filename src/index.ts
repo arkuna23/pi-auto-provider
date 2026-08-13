@@ -95,6 +95,7 @@ function formatSummary(manager: AutoProviderManager, refreshErrors: string[]): s
   const lines = ["auto-model-provider refresh summary"];
   for (const report of manager.getReports()) {
     lines.push(`${report.providerId}: ${report.modelCount} model(s), ${report.cacheUpdated} parameter cache update(s), ${report.defaults} default parameter set(s)`);
+    if (report.officialFallbacks > 0) lines.push(`  official fallback: ${report.officialFallbacks} model(s)`);
     if (report.ambiguities.length > 0) lines.push(`  ambiguous: ${report.ambiguities.join(", ")}`);
     if (report.errors.length > 0) lines.push(`  config: ${report.errors.join("; ")}`);
     if (report.modelsDevError) lines.push(`  models.dev: ${report.modelsDevError}`);

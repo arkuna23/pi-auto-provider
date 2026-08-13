@@ -53,6 +53,7 @@ export interface BuiltinModelCandidate {
 
 export interface ParameterReport {
   defaults: boolean;
+  officialFallback?: boolean;
   ambiguity?: string;
   source?: string;
   sourceError?: string;
@@ -62,6 +63,7 @@ export interface RefreshReport {
   providerId: string;
   modelCount: number;
   cacheUpdated: number;
+  officialFallbacks: number;
   defaults: number;
   ambiguities: string[];
   errors: string[];

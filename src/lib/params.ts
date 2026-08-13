@@ -44,14 +44,17 @@ export function buildProviderModel(
   fallback?: Model<Api>,
 ): BuiltModelResult {
   const key = `${spec.id}/${modelId}`;
-  const builtinMatch = findBuiltinCandidate(sources.builtins, modelId, spec.id);
+  const builtinMatch = findBuiltinCandidate(sources.builtins, modelId, spec.id, { officialFallback: true });
   const base = builtinMatch.model
     ? fromPiModel(modelId, spec.api, builtinMatch.model)
     : fallback
       ? fromPiModel(modelId, spec.api, fallback)
       : { ...DEFAULT_MODEL_PARAMS, id: modelId, name: modelId };
   let params = mergeModel(base, spec.compat ? { compat: spec.compat } : undefined);
-  let report: ParameterReport = { defaults: !builtinMatch.model && !fallback };
+  let report: ParameterReport = {
+    defaults: !builtinMatch.model && !fallback,
+    officialFallback: Boolean(builtinMatch.model && builtinMatch.provider && builtinMatch.provider !== spec.id),
+  };
   if (builtinMatch.ambiguity) report = { ...report, ambiguity: builtinMatch.ambiguity };
 
   const cached = sources.cache.get(key);
@@ -60,6 +63,7 @@ export function buildProviderModel(
     report = {
       ...report,
       defaults: false,
+      officialFallback: report.officialFallback || Boolean(cached.source),
       source: cached.source ?? report.source,
     };
   }
@@ -68,10 +72,15 @@ export function buildProviderModel(
   let catalogEntry: ModelOverride | undefined;
   if (needsCatalog && sources.catalog) {
     const sourceOverride = sources.project.get(key)?.source ?? sources.user.get(key)?.source;
-    const match = findCatalogCandidate(sources.catalog.values(), modelId, sourceOverride, spec.id);
+    const match = findCatalogCandidate(sources.catalog.values(), modelId, sourceOverride, spec.id, { officialFallback: true });
     if (match.candidate) {
       params = fromCatalogModel(modelId, spec.api, match.candidate.data, spec.compat);
-      report = { ...report, defaults: false, source: match.candidate.source };
+      report = {
+        ...report,
+        defaults: false,
+        officialFallback: report.officialFallback || !sourceOverride,
+        source: match.candidate.source,
+      };
       catalogEntry = catalogCacheEntry(params, match.candidate.source);
     } else if (match.ambiguity) {
       report = { ...report, ambiguity: match.ambiguity };

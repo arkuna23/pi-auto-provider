@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
   AutoProviderManager,
+  buildProviderModel,
   buildRequestUrl,
   fetchRemoteModelIds,
   fetchModelsDev,
@@ -15,7 +16,8 @@ import {
   resetModelsDevRequest,
   selectAutoProviders,
 } from "../src/index.js";
-import type { AutoProviderSpec, BuiltinModelCandidate, RefreshModelsContextLike } from "../src/types.js";
+import { builtinModelCandidates } from "../src/lib/builtins.js";
+import type { AutoProviderSpec, RefreshModelsContextLike } from "../src/types.js";
 
 const originalFetch = globalThis.fetch;
 const temporaryDirectories: string[] = [];
@@ -62,6 +64,34 @@ describe("provider selection and override parsing", () => {
     const emptyProvider = await loadOverrideLayer(path);
     assert.equal(emptyProvider.entries.size, 0);
     assert.match(emptyProvider.error ?? "", /provider id must not be empty/);
+  });
+
+  it("uses the official Codex parameters for an unqualified custom-provider model", () => {
+    const candidates = builtinModelCandidates().filter(
+      (entry) => entry.model.id === "gpt-5.5" && ["openai", "openai-codex"].includes(entry.provider),
+    );
+    assert.equal(candidates.length, 2);
+    const spec = { ...providerSpec("http://127.0.0.1:1234"), id: "sub2api", api: "openai-responses" as AutoProviderSpec["api"] };
+    const result = buildProviderModel(spec, "gpt-5.5", {
+      builtins: candidates,
+      cache: new Map(),
+      user: new Map(),
+      project: new Map(),
+      force: false,
+    });
+    assert.equal(result.config.contextWindow, 272000);
+    assert.equal(result.config.maxTokens, 128000);
+    assert.equal(result.config.thinkingLevelMap?.xhigh, "xhigh");
+    assert.equal(result.report.officialFallback, true);
+
+    const prefixed = buildProviderModel(spec, "openai-codex/gpt-5.5", {
+      builtins: candidates,
+      cache: new Map(),
+      user: new Map(),
+      project: new Map(),
+      force: false,
+    });
+    assert.equal(prefixed.config.thinkingLevelMap?.xhigh, "xhigh");
   });
 });
 
@@ -119,6 +149,7 @@ describe("refresh behavior", () => {
     assert.equal(models[0].cost.output, 9);
     assert.equal(models[1].contextWindow, 1000);
     assert.equal(published.length, 1);
+    assert.equal(manager.getReports()[0].officialFallbacks, 2);
     assert.equal(requests[0].url, "/v1/models");
     assert.equal(requests[0].headers.get("authorization"), "Bearer secret");
     assert.equal(requests[0].headers.get("x-test"), "resolved");
@@ -223,6 +254,16 @@ it("reports ambiguous models.dev candidates instead of guessing", () => {
   const first = { source: "a/foo", provider: "a", modelKey: "foo", data: { id: "foo" } };
   const second = { source: "b/foo", provider: "b", modelKey: "foo", data: { id: "foo" } };
   assert.match(findCatalogCandidate([first, second], "foo").ambiguity ?? "", /multiple/);
+});
+
+it("uses the official provider priority for an ambiguous custom-provider catalog match", () => {
+  const candidates = [
+    { source: "openai/foo", provider: "openai", modelKey: "foo", data: { id: "foo" } },
+    { source: "openai-codex/foo", provider: "openai-codex", modelKey: "foo", data: { id: "foo" } },
+    { source: "anthropic/foo", provider: "anthropic", modelKey: "foo", data: { id: "foo" } },
+  ];
+  const match = findCatalogCandidate(candidates, "foo", undefined, "sub2api", { officialFallback: true });
+  assert.equal(match.candidate?.source, "openai-codex/foo");
 });
 
 it("does not start a models.dev request after cancellation", async () => {

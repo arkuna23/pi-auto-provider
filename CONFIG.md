@@ -98,6 +98,13 @@ When no source provides parameters, defaults are used:
 }
 ```
 
+For custom providers, matching a model against Pi's official catalogs is the
+fallback when the proxy itself does not provide parameter metadata. A vendor
+prefix in the model id wins first; for an unqualified id with multiple
+official matches, the deterministic order is
+`openai-codex > openai > anthropic > google > deepseek > other provider ids`.
+Unknown models continue to use the defaults above.
+
 ## 3. User overrides (`auto-models.json`)
 
 Place overrides in `~/.pi/agent/auto-models.json`. Overrides are keyed by

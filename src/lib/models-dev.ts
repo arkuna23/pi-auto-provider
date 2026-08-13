@@ -1,4 +1,5 @@
 import type { CatalogModel, JsonObject } from "../types.js";
+import { preferProviderByOfficialPriority } from "./provider-priority.js";
 
 export const MODELS_DEV_URL = "https://models.dev/api.json";
 
@@ -29,6 +30,7 @@ export function findCatalogCandidate(
   modelId: string,
   source?: string,
   providerHint?: string,
+  options: { officialFallback?: boolean } = {},
 ): { candidate?: CatalogModel; ambiguity?: string } {
   const candidates = [...catalog];
   if (source) {
@@ -54,7 +56,7 @@ export function findCatalogCandidate(
   const exactModel = candidates.filter((entry) => entry.modelKey === modelId || entry.data.id === modelId);
   if (exactModel.length === 1) return { candidate: exactModel[0] };
   if (exactModel.length > 1) {
-    const preferred = preferCatalogProvider(exactModel, providerHint, modelId);
+    const preferred = preferCatalogProvider(exactModel, providerHint, modelId, options.officialFallback);
     if (preferred.length === 1) return { candidate: preferred[0] };
     return { ambiguity: `model "${modelId}" has multiple vendor matches` };
   }
@@ -62,7 +64,7 @@ export function findCatalogCandidate(
   const suffix = candidates.filter((entry) => entry.modelKey.endsWith(`/${modelId}`) || entry.source.endsWith(`/${modelId}`));
   if (suffix.length === 1) return { candidate: suffix[0] };
   if (suffix.length > 1) {
-    const preferred = preferCatalogProvider(suffix, providerHint, modelId);
+    const preferred = preferCatalogProvider(suffix, providerHint, modelId, options.officialFallback);
     if (preferred.length === 1) return { candidate: preferred[0] };
     return { ambiguity: `model "${modelId}" has multiple vendor matches` };
   }
@@ -74,16 +76,30 @@ export function findCatalogCandidate(
       return sourceVendor === modelVendor && (entry.source === modelId || entry.modelKey === modelId.slice(modelId.indexOf("/") + 1));
     });
     if (vendor.length === 1) return { candidate: vendor[0] };
-    if (vendor.length > 1) return { ambiguity: `model "${modelId}" has multiple vendor matches` };
+    if (vendor.length > 1) {
+      const preferred = preferCatalogProvider(vendor, providerHint, modelId, options.officialFallback);
+      if (preferred.length === 1) return { candidate: preferred[0] };
+      return { ambiguity: `model "${modelId}" has multiple vendor matches` };
+    }
   }
 
   return {};
 }
 
-function preferCatalogProvider(candidates: readonly CatalogModel[], hint: string | undefined, modelId: string): CatalogModel[] {
+function preferCatalogProvider(
+  candidates: readonly CatalogModel[],
+  hint: string | undefined,
+  modelId: string,
+  officialFallback = false,
+): CatalogModel[] {
   const vendor = modelId.includes("/") ? modelId.split("/", 1)[0] : undefined;
-  const hints = [vendor, hint].filter((value): value is string => Boolean(value)).flatMap((value) => [value, value.split(/[-_]/, 1)[0]]);
-  return candidates.filter((entry) => hints.some((value) => entry.provider === value || entry.provider.startsWith(`${value}-`)));
+  const exactHints = [vendor, hint].filter((value): value is string => Boolean(value));
+  const exactPreferred = candidates.filter((entry) => exactHints.includes(entry.provider));
+  if (exactPreferred.length > 0) return exactPreferred;
+  const hints = exactHints.flatMap((value) => [value, value.split(/[-_]/, 1)[0]]);
+  const preferred = candidates.filter((entry) => hints.some((value) => entry.provider === value || entry.provider.startsWith(`${value}-`)));
+  if (preferred.length > 0) return preferred;
+  return officialFallback ? preferProviderByOfficialPriority(candidates) : [];
 }
 
 async function requestCatalog(): Promise<Map<string, CatalogModel>> {
