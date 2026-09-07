@@ -13,18 +13,15 @@ import type {
 
 export interface ParameterSources {
   builtins: readonly BuiltinModelCandidate[];
-  cache: Map<string, ModelOverride>;
-  user: Map<string, ModelOverride>;
-  project: Map<string, ModelOverride>;
   catalog?: Map<string, CatalogModel>;
   force: boolean;
 }
 
 export interface BuiltModelResult {
   config: AutoModelConfig;
+  persistedConfig: AutoModelConfig;
   runtime: Model<Api>;
   report: ParameterReport;
-  catalogEntry?: ModelOverride;
 }
 
 export const DEFAULT_MODEL_PARAMS: AutoModelConfig = {
@@ -43,66 +40,45 @@ export function buildProviderModel(
   sources: ParameterSources,
   fallback?: Model<Api>,
 ): BuiltModelResult {
-  const key = `${spec.id}/${modelId}`;
   const builtinMatch = findBuiltinCandidate(sources.builtins, modelId, spec.id, { officialFallback: true });
   const base = builtinMatch.model
     ? fromPiModel(modelId, spec.api, builtinMatch.model)
     : fallback
       ? fromPiModel(modelId, spec.api, fallback)
-      : { ...DEFAULT_MODEL_PARAMS, id: modelId, name: modelId };
-  let params = mergeModel(base, spec.compat ? { compat: spec.compat } : undefined);
-  let report: ParameterReport = {
+      : { ...DEFAULT_MODEL_PARAMS, id: modelId, name: modelId, api: spec.api };
+  let params = base;
+  const report: ParameterReport = {
     defaults: !builtinMatch.model && !fallback,
     officialFallback: Boolean(builtinMatch.model && builtinMatch.provider && builtinMatch.provider !== spec.id),
+    ...(builtinMatch.ambiguity ? { ambiguity: builtinMatch.ambiguity } : {}),
   };
-  if (builtinMatch.ambiguity) report = { ...report, ambiguity: builtinMatch.ambiguity };
 
-  const cached = sources.cache.get(key);
-  if (cached) {
-    params = mergeModel(params, stripSource(cached));
-    report = {
-      ...report,
-      defaults: false,
-      officialFallback: report.officialFallback || Boolean(cached.source),
-      source: cached.source ?? report.source,
-    };
-  }
-
-  const needsCatalog = sources.force || !builtinMatch.model && !cached || hasExplicitSource(sources.user, key) || hasExplicitSource(sources.project, key);
-  let catalogEntry: ModelOverride | undefined;
-  if (needsCatalog && sources.catalog) {
-    const sourceOverride = sources.project.get(key)?.source ?? sources.user.get(key)?.source;
-    const match = findCatalogCandidate(sources.catalog.values(), modelId, sourceOverride, spec.id, { officialFallback: true });
+  if (sources.catalog && (sources.force || !builtinMatch.model)) {
+    const match = findCatalogCandidate(sources.catalog.values(), modelId, undefined, spec.id, { officialFallback: true });
     if (match.candidate) {
       params = fromCatalogModel(modelId, spec.api, match.candidate.data, spec.compat);
-      report = {
-        ...report,
-        defaults: false,
-        officialFallback: report.officialFallback || !sourceOverride,
-        source: match.candidate.source,
-      };
-      catalogEntry = catalogCacheEntry(params, match.candidate.source);
+      report.defaults = false;
+      report.officialFallback = report.officialFallback || !match.candidate.source.startsWith(`${spec.id}/`);
+      report.source = match.candidate.source;
     } else if (match.ambiguity) {
-      report = { ...report, ambiguity: match.ambiguity };
-      if (sourceOverride) report = { ...report, sourceError: match.ambiguity };
-      else {
+      if (builtinMatch.model || fallback) {
+        report.ambiguity = match.ambiguity;
+      } else {
         params = { ...DEFAULT_MODEL_PARAMS, id: modelId, name: modelId, api: spec.api };
-        report = { ...report, defaults: true };
+        report.ambiguity = match.ambiguity;
+        report.defaults = true;
       }
     }
   }
 
-  const user = sources.user.get(key);
-  const project = sources.project.get(key);
-  params = applyOverride(params, user, sources.catalog, spec.api, spec.id, modelId, report);
-  params = applyOverride(params, project, sources.catalog, spec.api, spec.id, modelId, report);
-  params = ensureModelShape(params, modelId, spec.api, spec.compat);
+  const persistedConfig = ensureModelShape(params, modelId, spec.api, spec.compat);
+  const effectiveConfig = ensureModelShape(mergeModel(persistedConfig, spec.modelOverrides?.[modelId]), modelId, spec.api);
   const runtime: Model<Api> = {
-    ...params,
+    ...effectiveConfig,
     provider: spec.id,
     baseUrl: spec.baseUrl,
   } as Model<Api>;
-  return { config: params, runtime, report, catalogEntry };
+  return { config: effectiveConfig, persistedConfig, runtime, report };
 }
 
 export function fromCatalogModel(
@@ -117,7 +93,7 @@ export function fromCatalogModel(
   const input = Array.isArray(rawInput)
     ? (rawInput as unknown[]).filter((entry): entry is "text" | "image" => entry === "text" || entry === "image")
     : [];
-  const mapped: AutoModelConfig = {
+  return {
     id: modelId,
     name: typeof data.name === "string" && data.name.trim() ? data.name : modelId,
     api,
@@ -129,7 +105,6 @@ export function fromCatalogModel(
     thinkingLevelMap: mapThinkingLevels(data.reasoning_options),
     compat: mapCompat(data, providerCompat),
   };
-  return mapped;
 }
 
 export function fromPiModel(modelId: string, api: Api, model: Model<Api>): AutoModelConfig {
@@ -144,8 +119,8 @@ export function fromPiModel(modelId: string, api: Api, model: Model<Api>): AutoM
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
     ...(model.samplingParams ? { samplingParams: { ...model.samplingParams } } : {}),
-    ...(model.compat ? { compat: cloneObject(model.compat) } : {}),
     ...(model.headers ? { headers: { ...model.headers } } : {}),
+    ...(model.compat ? { compat: cloneObject(model.compat) } : {}),
   };
 }
 
@@ -178,42 +153,6 @@ export function deepMerge<T>(base: T, override: unknown): T {
   return override as T;
 }
 
-export function stripSource(override: ModelOverride): ModelOverride {
-  const { source: _source, ...rest } = override;
-  return rest;
-}
-
-function applyOverride(
-  params: AutoModelConfig,
-  override: ModelOverride | undefined,
-  catalog: Map<string, CatalogModel> | undefined,
-  api: Api,
-  providerHint: string,
-  modelId: string,
-  report: ParameterReport,
-): AutoModelConfig {
-  if (!override) return params;
-  let result = params;
-  if (override.source) {
-    if (catalog) {
-      const match = findCatalogCandidate(catalog.values(), modelId, override.source, providerHint);
-      if (match.candidate) result = fromCatalogModel(modelId, api, match.candidate.data);
-      else {
-        report.sourceError = match.ambiguity ?? `source "${override.source}" was not found`;
-        report.defaults = true;
-        result = { ...DEFAULT_MODEL_PARAMS, id: modelId, name: modelId, api };
-      }
-    } else {
-      report.sourceError = `source "${override.source}" could not be resolved because models.dev is unavailable`;
-      // Keep the best known base (built-in model, generated cache, or the
-      // ordinary defaults) when the catalog cannot be reached. A source
-      // override is still reported so the user can retry after restoring
-      // network access.
-    }
-  }
-  return mergeModel(result, stripSource(override));
-}
-
 function ensureModelShape(
   params: AutoModelConfig,
   modelId: string,
@@ -226,22 +165,13 @@ function ensureModelShape(
     id: modelId,
     name: params.name || modelId,
     api,
-    compat: providerCompat ? (deepMerge(providerCompat, params.compat) as AutoModelConfig["compat"]) : params.compat,
+    // Settings-backed provider compatibility is authoritative over stale model data.
+    compat: providerCompat ? (deepMerge(params.compat, providerCompat) as AutoModelConfig["compat"]) : params.compat,
     cost: {
       ...DEFAULT_MODEL_PARAMS.cost,
       ...params.cost,
     },
   };
-}
-
-function catalogCacheEntry(params: AutoModelConfig, source?: string): ModelOverride | undefined {
-  if (!source) return undefined;
-  const { id: _id, api: _api, ...rest } = params;
-  return { source, ...rest } as unknown as ModelOverride;
-}
-
-function hasExplicitSource(entries: Map<string, ModelOverride>, key: string): boolean {
-  return typeof entries.get(key)?.source === "string";
 }
 
 function mapCost(cost: JsonObject): AutoModelConfig["cost"] {

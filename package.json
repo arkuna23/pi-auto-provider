@@ -1,7 +1,7 @@
 {
   "name": "pi-auto-provider",
   "version": "0.1.0",
-  "description": "Discover OpenAI-compatible models configured in Pi models.json and enrich their parameters.",
+  "description": "Discover OpenAI-compatible models configured in auto-provider.json and persist static catalogs.",
   "keywords": ["pi-package"],
   "type": "module",
   "main": "./dist/index.js",

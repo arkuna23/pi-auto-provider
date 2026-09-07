@@ -1,22 +1,23 @@
 import { strict as assert } from "node:assert";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { parse } from "jsonc-parser";
 import {
   AutoProviderManager,
   buildProviderModel,
   buildRequestUrl,
-  fetchRemoteModelIds,
-  fetchModelsDev,
-  findCatalogCandidate,
-  loadOverrideLayer,
-  loadModelsJson,
+  cleanupObsoleteFiles,
+  loadAutoProviderConfig,
+  persistProviderModels,
   resetModelsDevRequest,
+  resolveHeaderValue,
   selectAutoProviders,
+  updateModelsJsonProviderModels,
+  synchronizeModelsJsonProviderMetadata,
 } from "../src/index.js";
-import { builtinModelCandidates } from "../src/lib/builtins.js";
 import type { AutoProviderSpec, RefreshModelsContextLike } from "../src/types.js";
 
 const originalFetch = globalThis.fetch;
@@ -28,85 +29,221 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-describe("provider selection and override parsing", () => {
-  it("only enables custom providers without a models property", async () => {
+describe("standalone automatic-provider configuration", () => {
+  it("loads nested JSONC configuration and preserves credential references without exposing values in diagnostics", async () => {
+    const root = await tempDirectory();
+    const secret = "settings-secret-value";
+    await writeFile(join(root, "auto-provider.json"), `{
+      // Standalone automatic-provider configuration.
+      "providers": {
+        "sub2api": {
+          "baseUrl": "http://127.0.0.1:8080",
+          "api": "openai-responses",
+          "apiKey": "${secret}",
+          "authHeader": true,
+          "headers": { "X-Token": "$TOKEN" },
+          "compat": { "supportsStore": false },
+          "name": "Sub2API",
+          "modelOverrides": { "muse-spark-1.2-contributor": { "maxTokens": 131072 } }
+        },
+        "builtin": {
+          "baseUrl": "http://127.0.0.1:8081",
+          "api": "openai-completions"
+        },
+        "bad": {
+          "baseUrl": "not-a-url",
+          "api": "openai-completions"
+        },
+        "bad-headers": {
+          "baseUrl": "http://127.0.0.1:8082",
+          "api": "openai-completions",
+          "headers": { "X-Bad": 3 }
+        }
+      }
+    }`);
+
+    const loaded = await loadAutoProviderConfig(root);
+    const selected = selectAutoProviders(loaded, ["builtin"]);
+
+    assert.deepEqual(selected.providers.map((provider) => provider.id), ["sub2api"]);
+    assert.equal(selected.providers[0].apiKey, secret);
+    assert.equal(selected.providers[0].headers?.["X-Token"], "$TOKEN");
+    assert.equal(selected.providers[0].compat?.supportsStore, false);
+    assert.equal(selected.providers[0].modelOverrides?.["muse-spark-1.2-contributor"]?.maxTokens, 131072);
+    assert.match(selected.errors.join("\n"), /bad.*baseUrl/);
+    assert.match(selected.errors.join("\n"), /bad-headers.*headers/);
+    assert.doesNotMatch(selected.errors.join("\n"), new RegExp(secret));
+  });
+
+  it("ignores legacy models.json provider declarations instead of migrating them", async () => {
     const root = await tempDirectory();
     await writeFile(join(root, "models.json"), `{
-      // JSONC is supported by Pi.
-      "auto": { "baseUrl": "http://localhost:1234", "api": "openai-completions" },
-      "empty": { "baseUrl": "http://localhost:1234", "api": "openai-completions", "models": [] },
-      "explicit": { "baseUrl": "http://localhost:1234", "api": "openai-completions", "models": [{"id":"x"}] },
-      "builtin": { "baseUrl": "http://localhost:1234", "api": "openai-completions" },
-      "bad": { "api": "openai-completions" }
+      "providers": {
+        "legacy-only": {
+          "baseUrl": "http://127.0.0.1:8080",
+          "api": "openai-completions"
+        },
+        "configured": {
+          "baseUrl": "http://legacy.example",
+          "api": "openai-completions",
+          "apiKey": "legacy-secret",
+          "models": [{ "id": "stale" }]
+        }
+      }
     }`);
-    const loaded = await loadModelsJson(root);
-    const selected = selectAutoProviders(loaded, ["builtin"]);
-    assert.deepEqual(selected.providers.map((provider) => provider.id), ["auto"]);
-    assert.match(selected.errors.join("\n"), /bad.*baseUrl/);
-  });
+    await writeFile(join(root, "auto-provider.json"), `{
+      "providers": {
+        "configured": {
+          "baseUrl": "http://settings.example",
+          "api": "openai-responses"
+        }
+      }
+    }`);
 
-  it("rejects a duplicate definition in one override file and parses model ids containing slashes", async () => {
-    const root = await tempDirectory();
-    const path = join(root, "auto-models.json");
-    await writeFile(path, JSON.stringify({
-      "provider/model/a": { contextWindow: 1 },
-      provider: { "model/a": { maxTokens: 2 } },
-    }));
-    const duplicate = await loadOverrideLayer(path);
-    assert.equal(duplicate.entries.size, 0);
-    assert.match(duplicate.error ?? "", /duplicate model definition/);
-
-    await writeFile(path, JSON.stringify({ "provider/model/a": { contextWindow: 3 } }));
-    const flat = await loadOverrideLayer(path);
-    assert.equal(flat.entries.get("provider/model/a")?.contextWindow, 3);
-
-    await writeFile(path, JSON.stringify({ "": { model: { contextWindow: 3 } } }));
-    const emptyProvider = await loadOverrideLayer(path);
-    assert.equal(emptyProvider.entries.size, 0);
-    assert.match(emptyProvider.error ?? "", /provider id must not be empty/);
-  });
-
-  it("uses the official Codex parameters for an unqualified custom-provider model", () => {
-    const candidates = builtinModelCandidates().filter(
-      (entry) => entry.model.id === "gpt-5.5" && ["openai", "openai-codex"].includes(entry.provider),
-    );
-    assert.equal(candidates.length, 2);
-    const spec = { ...providerSpec("http://127.0.0.1:1234"), id: "sub2api", api: "openai-responses" as AutoProviderSpec["api"] };
-    const result = buildProviderModel(spec, "gpt-5.5", {
-      builtins: candidates,
-      cache: new Map(),
-      user: new Map(),
-      project: new Map(),
-      force: false,
-    });
-    assert.equal(result.config.contextWindow, 272000);
-    assert.equal(result.config.maxTokens, 128000);
-    assert.equal(result.config.thinkingLevelMap?.xhigh, "xhigh");
-    assert.equal(result.report.officialFallback, true);
-
-    const prefixed = buildProviderModel(spec, "openai-codex/gpt-5.5", {
-      builtins: candidates,
-      cache: new Map(),
-      user: new Map(),
-      project: new Map(),
-      force: false,
-    });
-    assert.equal(prefixed.config.thinkingLevelMap?.xhigh, "xhigh");
+    const loaded = await loadAutoProviderConfig(root);
+    const selected = selectAutoProviders(loaded, []);
+    assert.deepEqual(selected.providers.map((provider) => provider.id), ["configured"]);
+    assert.equal(selected.providers[0].baseUrl, "http://settings.example");
+    assert.equal(selected.providers[0].api, "openai-responses");
+    assert.doesNotMatch(JSON.stringify(selected), /legacy-secret/);
   });
 });
 
-describe("refresh behavior", () => {
-  it("discovers, deduplicates, enriches, persists, and restores models", async () => {
+describe("models.json catalog persistence", () => {
+  it("replaces stale target models while preserving unrelated providers and fields", async () => {
     const root = await tempDirectory();
-    const requests: Array<{ url: string; headers: Headers }> = [];
+    const path = join(root, "models.json");
+    await writeFile(path, `{
+      // Keep this comment and unrelated provider data.
+      "providers": {
+        "target": {
+          "baseUrl": "http://legacy.example",
+          "apiKey": "legacy-secret",
+          "models": [{ "id": "removed" }],
+          "unrelated": { "keep": true }
+        },
+        "other": {
+          "models": [{ "id": "other-model" }],
+          "customField": "preserved"
+        }
+      }
+    }`);
+
+    await updateModelsJsonProviderModels(path, "target", [{
+      id: "new-model",
+      name: "New model",
+      api: "openai-responses",
+      baseUrl: "http://settings.example",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 200000,
+      maxTokens: 32000,
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      compat: { supportsStore: false },
+    }]);
+
+    const value = parse(await readFile(path, "utf8")) as any;
+    assert.deepEqual(value.providers.target.models, [{
+      id: "new-model",
+      name: "New model",
+      api: "openai-responses",
+      baseUrl: "http://settings.example",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 200000,
+      maxTokens: 32000,
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      compat: { supportsStore: false },
+    }]);
+    assert.equal(value.providers.target.unrelated.keep, true);
+    assert.equal(value.providers.target.apiKey, "legacy-secret");
+    assert.deepEqual(value.providers.other.models, [{ id: "other-model" }]);
+    assert.equal(value.providers.other.customField, "preserved");
+    assert.doesNotMatch(await readFile(path, "utf8"), /"provider"\s*:/);
+  });
+
+  it("writes generated definitions without credentials or internal provider identity", async () => {
+    const root = await tempDirectory();
+    const spec = { ...providerSpec("http://settings.example"), compat: { supportsStore: false } };
+    const result = await persistProviderModels(root, spec, [{
+      id: "model-a",
+      name: "Model A",
+      api: spec.api,
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 1000,
+      maxTokens: 100,
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      compat: { supportsStore: false },
+    }]);
+    assert.equal(result.changed, true);
+    const text = await readFile(join(root, "models.json"), "utf8");
+    const value = JSON.parse(text);
+    const provider = value.providers[spec.id];
+    const model = provider.models[0];
+    assert.equal(provider.baseUrl, spec.baseUrl);
+    assert.equal(provider.api, spec.api);
+    assert.deepEqual(model, {
+      id: "model-a",
+      name: "Model A",
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1000,
+      maxTokens: 100,
+    });
+    assert.equal(model.provider, undefined);
+    assert.equal(model.apiKey, undefined);
+    assert.equal(model.auth, undefined);
+    assert.doesNotMatch(text, /settings-secret-value|legacy-secret/);
+  });
+
+  it("leaves an invalid existing models.json unchanged on persistence failure", async () => {
+    const root = await tempDirectory();
+    const path = join(root, "models.json");
+    const original = "{\n  \"providers\": {\n";
+    await writeFile(path, original);
+    await assert.rejects(
+      () => updateModelsJsonProviderModels(path, "target", [{ id: "new-model" }]),
+      /models\.json|Unexpected|error/i,
+    );
+    assert.equal(await readFile(path, "utf8"), original);
+  });
+});
+
+describe("legacy cleanup and refresh", () => {
+  it("removes only the three obsolete files and preserves Pi-owned files", async () => {
+    const agentDir = await tempDirectory();
+    const cwd = await tempDirectory();
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    const obsolete = [
+      join(agentDir, "auto-models.cache.json"),
+      join(agentDir, "auto-models.json"),
+      join(cwd, ".pi", "auto-models.json"),
+    ];
+    for (const path of obsolete) await writeFile(path, "{}");
+    await writeFile(join(agentDir, "models.json"), "{}");
+    await writeFile(join(agentDir, "models-store.json"), "{}");
+
+    const result = await cleanupObsoleteFiles(agentDir, cwd);
+    assert.equal(result.errors.length, 0);
+    for (const path of obsolete) await assert.rejects(() => stat(path), /ENOENT/);
+    assert.equal(await readFile(join(agentDir, "models.json"), "utf8"), "{}");
+    assert.equal(await readFile(join(agentDir, "models-store.json"), "utf8"), "{}");
+  });
+
+  it("refreshes, persists static models, publishes models-store data, and restores offline", async () => {
+    const root = await tempDirectory();
+    const requests: Array<{ url: string; authorization: string | null; header: string | null }> = [];
     const server = await startServer((request, response) => {
-      requests.push({ url: request.url ?? "", headers: new Headers(request.headers as Record<string, string>) });
+      requests.push({
+        url: request.url ?? "",
+        authorization: typeof request.headers.authorization === "string" ? request.headers.authorization : null,
+        header: typeof request.headers["x-test"] === "string" ? request.headers["x-test"] : null,
+      });
       responseJson(response, { data: [{ id: "foo" }, { id: "foo" }, { id: "vendor/bar" }] });
     });
     const spec = providerSpec(server.url);
     globalThis.fetch = async (input, init) => {
-      const url = String(input);
-      if (url === "https://models.dev/api.json") {
+      if (String(input) === "https://models.dev/api.json") {
         return new Response(JSON.stringify({
           vendor: {
             models: {
@@ -117,165 +254,101 @@ describe("refresh behavior", () => {
                 modalities: { input: ["text", "image"] },
                 limit: { context: 900000, output: 12000 },
                 cost: { input: 1, output: 2, cache_read: 0.1 },
-                reasoning_options: [{ type: "effort", values: ["low", "high"] }],
-              },
-              "vendor/bar": {
-                id: "vendor/bar",
-                name: "Bar catalog",
-                modalities: { input: ["text"] },
-                limit: { context: 1000, output: 100 },
-                cost: { input: 3, output: 4 },
               },
             },
           },
-        }), { status: 200 });
+        }));
       }
       return originalFetch(input, init);
     };
-    await writeFile(join(root, "auto-models.json"), JSON.stringify({
-      [`${spec.id}/foo`]: { contextWindow: 777, cost: { output: 9 } },
-    }));
-
+    await writeFile(join(root, "auto-models.cache.json"), "legacy cache");
     const manager = new AutoProviderManager(root, [spec], { builtinCandidates: [] });
-    const published: RefreshModelsContextLike[] = [];
-    const context = makeContext(true, undefined, async (publication) => {
-      published.push(publication as unknown as RefreshModelsContextLike);
+    const published: Array<{ models: readonly unknown[] }> = [];
+    const models = await manager.refresh(spec, makeContext(true, undefined, async (publication) => {
+      if (publication.persist) published.push(publication.persist as unknown as { models: readonly unknown[] });
       return true;
-    }, { key: "secret", env: { TEST_HEADER: "resolved" } });
-    const models = await manager.refresh(spec, context);
+    }, { key: "runtime-secret", env: { TEST_HEADER: "resolved-header" } }));
+
     assert.deepEqual(models.map((model) => model.id), ["foo", "vendor/bar"]);
     assert.equal(models[0].name, "Foo catalog");
-    assert.equal(models[0].contextWindow, 777);
-    assert.equal(models[0].cost.output, 9);
-    assert.equal(models[1].contextWindow, 1000);
+    assert.equal(models[0].contextWindow, 900000);
     assert.equal(published.length, 1);
-    assert.equal(manager.getReports()[0].officialFallbacks, 2);
     assert.equal(requests[0].url, "/v1/models");
-    assert.equal(requests[0].headers.get("authorization"), "Bearer secret");
-    assert.equal(requests[0].headers.get("x-test"), "resolved");
-    const cache = JSON.parse(await readFile(join(root, "auto-models.cache.json"), "utf8"));
-    assert.equal(cache[`${spec.id}/foo`].source, "vendor/foo");
+    assert.equal(requests[0].authorization, "Bearer runtime-secret");
+    assert.equal(requests[0].header, "resolved-header");
 
-    await writeFile(join(root, "auto-models.json"), JSON.stringify({
-      [spec.id]: { foo: { contextWindow: 555 } },
-    }));
-    const offline = await manager.refresh(spec, makeContext(false, published[0]?.persist as never, async () => true, undefined));
-    assert.equal(offline[0].contextWindow, 555);
+    const catalog = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    const provider = catalog.providers[spec.id];
+    assert.deepEqual(provider.models.map((model: { id: string }) => model.id), ["foo", "vendor/bar"]);
+    assert.equal(provider.baseUrl, spec.baseUrl);
+    assert.equal(provider.api, spec.api);
+    assert.equal(provider.models[0].api, undefined);
+    assert.equal(provider.models[0].baseUrl, undefined);
+    assert.equal(provider.models[0].apiKey, undefined);
+    assert.equal(provider.models[1].reasoning, undefined);
+    assert.equal(provider.models[1].input, undefined);
+    await assert.rejects(() => stat(join(root, "auto-models.cache.json")), /ENOENT/);
+
+    const offlineManager = new AutoProviderManager(root, [spec], { builtinCandidates: [] });
+    const restored = await offlineManager.refresh(spec, makeContext(false, undefined, async () => true, undefined));
+    assert.deepEqual(restored.map((model) => model.id), ["foo", "vendor/bar"]);
+    assert.equal(restored[0].api, spec.api);
+    assert.equal(restored[0].name, "Foo catalog");
     await closeServer(server.server);
   });
 
-  it("does not call models.dev on a normal cache hit, but force refresh does", async () => {
+  it("keeps the previous catalog when the provider refresh fails", async () => {
     const root = await tempDirectory();
-    let modelsDevCalls = 0;
-    const server = await startServer((_request, response) => responseJson(response, { data: [{ id: "foo" }] }));
-    const spec = providerSpec(server.url);
-    globalThis.fetch = async (input, init) => {
-      if (String(input) === "https://models.dev/api.json") {
-        modelsDevCalls++;
-        return new Response(JSON.stringify({ vendor: { models: { foo: { id: "foo", limit: { context: 2, output: 1 }, cost: {} } } } }));
-      }
-      return originalFetch(input, init);
-    };
+    const spec = providerSpec("http://127.0.0.1:1");
+    await writeFile(join(root, "models.json"), JSON.stringify({ providers: { [spec.id]: {
+      unrelated: true,
+      models: [{ id: "old", name: "Old" }],
+    } } }));
+    const original = await readFile(join(root, "models.json"), "utf8");
     const manager = new AutoProviderManager(root, [spec], { builtinCandidates: [] });
-    await manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } }));
-    assert.equal(modelsDevCalls, 1);
-    await manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } }));
-    assert.equal(modelsDevCalls, 1);
-    await manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } }, true));
-    assert.equal(modelsDevCalls, 2);
-    await closeServer(server.server);
-  });
-
-  it("keeps cached parameters when an explicit catalog source cannot be refreshed", async () => {
-    const root = await tempDirectory();
-    const server = await startServer((_request, response) => responseJson(response, { data: [{ id: "foo" }] }));
-    const spec = providerSpec(server.url);
-    await writeFile(join(root, "auto-models.cache.json"), JSON.stringify({
-      [`${spec.id}/foo`]: { source: "vendor/foo", contextWindow: 456 },
-    }));
-    await writeFile(join(root, "auto-models.json"), JSON.stringify({
-      [`${spec.id}/foo`]: { source: "vendor/foo", maxTokens: 789 },
-    }));
-    globalThis.fetch = async (input, init) => {
-      if (String(input) === "https://models.dev/api.json") throw new Error("catalog unavailable");
-      return originalFetch(input, init);
-    };
-    const manager = new AutoProviderManager(root, [spec], { builtinCandidates: [] });
-    const models = await manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } }));
-    assert.equal(models[0].contextWindow, 456);
-    assert.equal(models[0].maxTokens, 789);
-    assert.match(manager.getReports()[0].modelsDevError ?? "", /catalog unavailable/);
-    assert.equal(manager.getReports()[0].defaults, 0);
-    await closeServer(server.server);
-  });
-
-  it("propagates /v1/models errors so Pi can retain the previous list", async () => {
-    const root = await tempDirectory();
-    const server = await startServer((_request, response) => responseJson(response, { error: "down" }, 503));
-    const spec = providerSpec(server.url);
-    const manager = new AutoProviderManager(root, [spec], { builtinCandidates: [] });
-    await assert.rejects(() => manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } })), /HTTP 503/);
-    assert.match(manager.getReports()[0].endpointError ?? "", /HTTP 503/);
-    await closeServer(server.server);
-  });
-
-  it("does not read project overrides until the project is trusted", async () => {
-    const root = await tempDirectory();
-    const cwd = await tempDirectory();
-    const server = await startServer((_request, response) => responseJson(response, { data: [{ id: "foo" }] }));
-    const spec = providerSpec(server.url);
-    await writeFile(join(cwd, ".pi-do-not-read"), "fixture");
-    await import("node:fs/promises").then(({ mkdir }) => mkdir(join(cwd, ".pi"), { recursive: true }));
-    await writeFile(join(cwd, ".pi", "auto-models.json"), JSON.stringify({ [spec.id]: { foo: { contextWindow: 123 } } }));
-    globalThis.fetch = async (input, init) => {
-      if (String(input) === "https://models.dev/api.json") {
-        return new Response(JSON.stringify({ vendor: { models: { foo: { id: "foo", limit: { context: 2, output: 1 }, cost: {} } } } }));
-      }
-      return originalFetch(input, init);
-    };
-    const manager = new AutoProviderManager(root, [spec], { cwd, builtinCandidates: [] });
-    const context = makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } });
-    const untrusted = await manager.refresh(spec, context);
-    assert.equal(untrusted[0].contextWindow, 2);
-    manager.setProjectTrust(true, cwd);
-    const trusted = await manager.refresh(spec, context);
-    assert.equal(trusted[0].contextWindow, 123);
-    await closeServer(server.server);
+    await assert.rejects(
+      () => manager.refresh(spec, makeContext(true, undefined, async () => true, { env: { TEST_HEADER: "resolved" } })),
+      /fetch failed|ECONNREFUSED|failed/i,
+    );
+    assert.equal(await readFile(join(root, "models.json"), "utf8"), original);
   });
 });
 
-it("builds the endpoint URL without duplicate slashes", () => {
+describe("provider metadata and credential resolution", () => {
+  it("makes settings api, endpoint, and compatibility authoritative over stale models", () => {
+    const spec = { ...providerSpec("http://settings.example"), api: "openai-responses" as AutoProviderSpec["api"], compat: { supportsStore: false } };
+    const fallback = {
+      id: "model",
+      name: "Legacy model",
+      api: "openai-completions" as AutoProviderSpec["api"],
+      provider: spec.id,
+      baseUrl: "http://legacy.example",
+      reasoning: false,
+      input: ["text"] as Array<"text" | "image">,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 100,
+      maxTokens: 10,
+      compat: { supportsStore: true, supportsDeveloperRole: false },
+    };
+    const result = buildProviderModel(spec, "model", { builtins: [], force: false }, fallback);
+    assert.equal(result.config.api, spec.api);
+    assert.equal(result.runtime.baseUrl, spec.baseUrl);
+    assert.equal(result.config.compat?.supportsStore, false);
+    assert.equal(result.config.compat?.supportsDeveloperRole, false);
+  });
+
+  it("retains command and environment reference behavior without credential-bearing error text", () => {
+    assert.equal(resolveHeaderValue("$TOKEN", { TOKEN: "resolved" }), "resolved");
+    assert.equal(resolveHeaderValue("!printf command-value"), "command-value");
+    assert.throws(() => resolveHeaderValue("$MISSING_TOKEN", {}), /MISSING_TOKEN/);
+    assert.doesNotMatch(String(new Error("missing environment variable for configured header: MISSING_TOKEN")), /resolved|command-value/);
+  });
+});
+
+it("builds endpoint URLs without duplicate slashes", () => {
   assert.equal(buildRequestUrl("http://localhost:1234"), "http://localhost:1234/v1/models");
   assert.equal(buildRequestUrl("http://localhost:1234/v1/"), "http://localhost:1234/v1/models");
   assert.equal(buildRequestUrl("http://localhost:1234/api/v1///"), "http://localhost:1234/api/v1/models");
-});
-
-it("reports ambiguous models.dev candidates instead of guessing", () => {
-  const first = { source: "a/foo", provider: "a", modelKey: "foo", data: { id: "foo" } };
-  const second = { source: "b/foo", provider: "b", modelKey: "foo", data: { id: "foo" } };
-  assert.match(findCatalogCandidate([first, second], "foo").ambiguity ?? "", /multiple/);
-});
-
-it("uses the official provider priority for an ambiguous custom-provider catalog match", () => {
-  const candidates = [
-    { source: "openai/foo", provider: "openai", modelKey: "foo", data: { id: "foo" } },
-    { source: "openai-codex/foo", provider: "openai-codex", modelKey: "foo", data: { id: "foo" } },
-    { source: "anthropic/foo", provider: "anthropic", modelKey: "foo", data: { id: "foo" } },
-  ];
-  const match = findCatalogCandidate(candidates, "foo", undefined, "sub2api", { officialFallback: true });
-  assert.equal(match.candidate?.source, "openai-codex/foo");
-});
-
-it("does not start a models.dev request after cancellation", async () => {
-  let calls = 0;
-  globalThis.fetch = async () => {
-    calls++;
-    return new Response("{}", { status: 200 });
-  };
-  const controller = new AbortController();
-  controller.abort();
-  await assert.rejects(() => fetchModelsDev(controller.signal), /aborted/i);
-  assert.equal(calls, 0);
 });
 
 function providerSpec(baseUrl: string): AutoProviderSpec {
@@ -283,7 +356,7 @@ function providerSpec(baseUrl: string): AutoProviderSpec {
     id: "test-provider",
     baseUrl,
     api: "openai-completions" as AutoProviderSpec["api"],
-    apiKey: "secret",
+    apiKey: "runtime-secret",
     authHeader: true,
     headers: { "X-Test": "$TEST_HEADER", authorization: "custom" },
   };

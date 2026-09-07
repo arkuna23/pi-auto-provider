@@ -7,19 +7,7 @@ import type { ProviderModelConfig as PiProviderModelConfig } from "@earendil-wor
 
 export type JsonObject = Record<string, unknown>;
 
-export interface ModelsJsonProviderConfig extends JsonObject {
-  name?: string;
-  baseUrl?: string;
-  apiKey?: string;
-  api?: string;
-  models?: unknown;
-  headers?: Record<string, string>;
-  authHeader?: boolean;
-  compat?: JsonObject;
-}
-
 export interface ModelOverride extends JsonObject {
-  source?: string;
   name?: string;
   reasoning?: boolean;
   thinkingLevelMap?: Record<string, string | null>;
@@ -27,16 +15,20 @@ export interface ModelOverride extends JsonObject {
   cost?: JsonObject;
   contextWindow?: number;
   maxTokens?: number;
-  samplingParams?: JsonObject;
+  samplingParams?: Record<string, unknown>;
   headers?: Record<string, string>;
   compat?: JsonObject;
 }
 
-export interface OverrideLayer {
-  path: string;
-  exists: boolean;
-  entries: Map<string, ModelOverride>;
-  error?: string;
+export interface AutoProviderConfig extends JsonObject {
+  name?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  api?: string;
+  headers?: Record<string, string>;
+  authHeader?: boolean;
+  compat?: JsonObject;
+  modelOverrides?: Record<string, ModelOverride>;
 }
 
 export interface CatalogModel {
@@ -62,13 +54,13 @@ export interface ParameterReport {
 export interface RefreshReport {
   providerId: string;
   modelCount: number;
-  cacheUpdated: number;
   officialFallbacks: number;
   defaults: number;
   ambiguities: string[];
   errors: string[];
   modelsDevError?: string;
   endpointError?: string;
+  modelsJsonError?: string;
   aborted?: boolean;
 }
 
@@ -90,6 +82,7 @@ export interface AutoProviderSpec {
   headers?: Record<string, string>;
   authHeader?: boolean;
   compat?: JsonObject;
+  modelOverrides?: Record<string, ModelOverride>;
 }
 
 export interface RefreshModelsContextLike {
