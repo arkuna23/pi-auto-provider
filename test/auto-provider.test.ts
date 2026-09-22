@@ -162,9 +162,9 @@ describe("models.json catalog persistence", () => {
     assert.doesNotMatch(await readFile(path, "utf8"), /"provider"\s*:/);
   });
 
-  it("writes generated definitions without credentials or internal provider identity", async () => {
+  it("writes provider registration and compact models so Pi can load them without this extension", async () => {
     const root = await tempDirectory();
-    const spec = { ...providerSpec("http://settings.example"), compat: { supportsStore: false } };
+    const spec = { ...providerSpec("http://settings.example"), name: "Settings example", compat: { supportsStore: false } };
     const result = await persistProviderModels(root, spec, [{
       id: "model-a",
       name: "Model A",
@@ -183,6 +183,10 @@ describe("models.json catalog persistence", () => {
     const model = provider.models[0];
     assert.equal(provider.baseUrl, spec.baseUrl);
     assert.equal(provider.api, spec.api);
+    assert.equal(provider.name, spec.name);
+    assert.equal(provider.apiKey, spec.apiKey);
+    assert.equal(provider.authHeader, true);
+    assert.deepEqual(provider.headers, spec.headers);
     assert.deepEqual(model, {
       id: "model-a",
       name: "Model A",
@@ -194,6 +198,52 @@ describe("models.json catalog persistence", () => {
     assert.equal(model.apiKey, undefined);
     assert.equal(model.auth, undefined);
     assert.doesNotMatch(text, /settings-secret-value|legacy-secret/);
+  });
+
+  it("copies command-form apiKey references into models.json without resolving them", async () => {
+    const root = await tempDirectory();
+    const spec = {
+      ...providerSpec("http://settings.example"),
+      apiKey: "!cat /tmp/proxy-key",
+      authHeader: true,
+    };
+    await persistProviderModels(root, spec, [{
+      id: "model-a",
+      name: "model-a",
+      api: spec.api,
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const provider = JSON.parse(await readFile(join(root, "models.json"), "utf8")).providers[spec.id];
+    assert.equal(provider.apiKey, "!cat /tmp/proxy-key");
+    assert.equal(provider.authHeader, true);
+    assert.doesNotMatch(JSON.stringify(provider.models), /apiKey|authHeader/);
+  });
+
+  it("synchronizes provider registration without replacing existing models", async () => {
+    const root = await tempDirectory();
+    const spec = { ...providerSpec("http://settings.example"), name: "Settings example" };
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        [spec.id]: {
+          api: "openai-responses",
+          baseUrl: "http://legacy.example",
+          models: [{ id: "kept" }],
+        },
+      },
+    }));
+    const result = await synchronizeModelsJsonProviderMetadata(root, spec);
+    assert.equal(result.changed, true);
+    const provider = JSON.parse(await readFile(join(root, "models.json"), "utf8")).providers[spec.id];
+    assert.deepEqual(provider.models, [{ id: "kept" }]);
+    assert.equal(provider.api, spec.api);
+    assert.equal(provider.baseUrl, spec.baseUrl);
+    assert.equal(provider.name, spec.name);
+    assert.equal(provider.apiKey, spec.apiKey);
+    assert.equal(provider.authHeader, true);
   });
 
   it("leaves an invalid existing models.json unchanged on persistence failure", async () => {
@@ -282,6 +332,9 @@ describe("legacy cleanup and refresh", () => {
     assert.deepEqual(provider.models.map((model: { id: string }) => model.id), ["foo", "vendor/bar"]);
     assert.equal(provider.baseUrl, spec.baseUrl);
     assert.equal(provider.api, spec.api);
+    assert.equal(provider.apiKey, spec.apiKey);
+    assert.equal(provider.authHeader, true);
+    assert.deepEqual(provider.headers, spec.headers);
     assert.equal(provider.models[0].api, undefined);
     assert.equal(provider.models[0].baseUrl, undefined);
     assert.equal(provider.models[0].apiKey, undefined);
