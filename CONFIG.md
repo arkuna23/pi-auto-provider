@@ -88,9 +88,10 @@ Pi resolves configured credential values using these forms:
 - `$$` emits a literal `$` and `$!` emits a literal `!`.
 - Other strings are literal values.
 
-The extension passes references through to Pi's provider registration and resolves
-request headers only for the outgoing request. Resolved credentials are not written
-to `models.json`, `models-store.json`, refresh summaries, or other plugin artifacts.
+The extension passes references through to Pi's provider registration and to `models.json` so
+processes without this extension can still authenticate. Request headers are resolved only for
+the outgoing refresh. Resolved credential values are not written to `models.json` or
+`models-store.json`; configured references such as `$ENV` and `!command` are copied as-is.
 
 ## Models catalog persistence
 
@@ -105,7 +106,7 @@ On a successful online refresh, the extension:
 Generated model definitions are compact. Shared provider metadata is written once at the
 Provider level, while each model keeps only its own stable restore metadata:
 
-- Provider-level `api`, `baseUrl`, and configured `compat` values
+- Provider-level `api`, `baseUrl`, configured `compat`, `name`, `apiKey`, `authHeader`, and `headers`
 - Model-level `id` and non-default `name`
 - reasoning and thinking-level capabilities when enabled
 - non-default input modalities
@@ -114,11 +115,9 @@ Provider level, while each model keeps only its own stable restore metadata:
 
 Default model values such as text-only input, non-reasoning, zero costs, a 128000
 context window, and a 16384 output limit are omitted and restored by the extension.
-The generated entries omit internal `provider` identity and all credential fields.
-Provider-level legacy fields that are unrelated to the generated `models` array may
-remain physically in `models.json`; they are not consumed as automatic-provider
-configuration. Standalone-file registration wins at runtime for connection,
-authentication, headers, compatibility, API, endpoint, and naming values.
+Generated **model** entries omit internal `provider` identity and credential fields.
+Provider-level `apiKey` stays as the configured reference so `--no-extensions` processes
+(such as subagents) can load the same catalog from `models.json`.
 
 The catalog update uses JSONC-aware structured edits, a lock, and atomic replacement.
 Unrelated providers and unrelated fields on the target provider are preserved. Read,
@@ -134,18 +133,18 @@ network request. Neither Pi-owned file is deleted by legacy cleanup.
 
 ## Runtime precedence
 
-For an automatic provider registered by this extension, settings values are the
-runtime authority even when stale fields remain in the corresponding `models.json`
-provider entry:
+When this extension is loaded, `auto-provider.json` is the runtime authority for connection,
+authentication, headers, compatibility, API, endpoint, and naming values:
 
-1. Settings-backed extension registration supplies provider name, API, endpoint, auth,
-   headers, auth-header behavior, compatibility, and refresh callback.
-2. The generated model array supplies static model metadata and restore definitions.
+1. Extension registration supplies provider name, API, endpoint, auth, headers, auth-header
+   behavior, compatibility, and the refresh callback.
+2. The generated `models.json` array supplies static model metadata and a standalone provider
+   registration for processes that do not load this extension.
 3. Pi's `models-store.json` supplies the separate offline runtime snapshot.
 
-Do not put automatic-provider credentials in `models.json`. Existing values there are
-ignored by this extension and may remain only because unrelated provider fields are
-preserved during catalog updates.
+Automatic-provider credentials belong in `auto-provider.json`. The extension copies those
+configured references into `models.json` so Pi can register the same provider without loading
+this extension. Resolved secret values are never written.
 
 ## Refreshing
 

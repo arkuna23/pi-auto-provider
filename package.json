@@ -1,7 +1,7 @@
 {
   "name": "pi-auto-provider",
-  "version": "0.1.0",
-  "description": "Discover OpenAI-compatible models configured in auto-provider.json and persist static catalogs.",
+  "version": "0.1.1",
+  "description": "Discover OpenAI-compatible models from auto-provider.json and persist the same catalog in models.json.",
   "keywords": ["pi-package"],
   "type": "module",
   "main": "./dist/index.js",

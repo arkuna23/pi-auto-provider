@@ -26,7 +26,7 @@ export interface ObsoleteFileCleanupResult {
   errors: string[];
 }
 
-/** Persist compact generated model definitions without treating models.json as provider configuration. */
+/** Persist compact model definitions plus the same provider registration Pi needs without this extension. */
 export async function persistProviderModels(
   agentDir: string,
   spec: AutoProviderSpec,
@@ -34,36 +34,19 @@ export async function persistProviderModels(
 ): Promise<ModelsJsonUpdateResult> {
   const path = join(agentDir, "models.json");
   const definitions = models.map((model) => toModelsJsonDefinition(spec, model));
-  const providerFields: JsonObject = {
-    api: spec.api,
-    baseUrl: spec.baseUrl,
-    ...(spec.compat ? { compat: cloneGeneratedMetadata(spec.compat) as JsonObject } : {}),
-    ...(spec.modelOverrides !== undefined ? { modelOverrides: cloneGeneratedMetadata(spec.modelOverrides) as JsonObject } : {}),
-  };
-  return updateModelsJsonProviderModels(path, spec.id, definitions, providerFields, [
-    ...(spec.compat === undefined ? ["compat"] : []),
-    ...(spec.modelOverrides === undefined ? ["modelOverrides"] : []),
-  ]);
+  const registration = modelsJsonProviderRegistration(spec);
+  return updateModelsJsonProviderModels(path, spec.id, definitions, registration.fields, registration.remove);
 }
 
 export const persistModelsJsonProviderModels = persistProviderModels;
  
-/** Synchronize only generated Provider metadata while preserving the existing models array. */
+/** Synchronize provider registration while preserving the existing models array. */
 export async function synchronizeModelsJsonProviderMetadata(
   agentDir: string,
   spec: AutoProviderSpec,
  ): Promise<ModelsJsonUpdateResult> {
   const path = join(agentDir, "models.json");
-  const providerFields: JsonObject = {
-    api: spec.api,
-    baseUrl: spec.baseUrl,
-    ...(spec.compat !== undefined ? { compat: cloneGeneratedMetadata(spec.compat) as JsonObject } : {}),
-    ...(spec.modelOverrides !== undefined ? { modelOverrides: cloneGeneratedMetadata(spec.modelOverrides) as JsonObject } : {}),
-  };
-  const removeProviderFields = [
-    ...(spec.compat === undefined ? ["compat"] : []),
-    ...(spec.modelOverrides === undefined ? ["modelOverrides"] : []),
-  ];
+  const registration = modelsJsonProviderRegistration(spec);
   const run = async (): Promise<ModelsJsonUpdateResult> => withModelsJsonLock(path, async () => {
     const current = await readModelsJsonText(path);
     const value = parseModelsJson(path, current);
@@ -71,10 +54,10 @@ export async function synchronizeModelsJsonProviderMetadata(
     const providerSegments = providerObjectPath(value, spec.id, path);
     const formattingOptions = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" } };
     let next = current;
-    for (const [key, fieldValue] of Object.entries(providerFields)) {
-      next = applyEdits(next, modify(next, [...providerSegments, key], cloneGeneratedMetadata(fieldValue), formattingOptions));
+    for (const [key, fieldValue] of Object.entries(registration.fields)) {
+      next = applyEdits(next, modify(next, [...providerSegments, key], cloneGeneratedMetadata(fieldValue, { preserveSecrets: true }), formattingOptions));
     }
-    for (const key of removeProviderFields) {
+    for (const key of registration.remove) {
       next = applyEdits(next, modify(next, [...providerSegments, key], undefined, formattingOptions));
     }
     parseModelsJson(path, next);
@@ -107,7 +90,7 @@ export async function updateModelsJsonProviderModels(
     let next = applyEdits(current, modify(current, pathSegments, definitions, formattingOptions));
     const providerSegments = pathSegments.slice(0, -1);
     for (const [key, fieldValue] of Object.entries(providerFields)) {
-      next = applyEdits(next, modify(next, [...providerSegments, key], cloneGeneratedMetadata(fieldValue), formattingOptions));
+      next = applyEdits(next, modify(next, [...providerSegments, key], cloneGeneratedMetadata(fieldValue, { preserveSecrets: true }), formattingOptions));
     }
     for (const key of removeProviderFields) {
       next = applyEdits(next, modify(next, [...providerSegments, key], undefined, formattingOptions));
@@ -120,6 +103,27 @@ export async function updateModelsJsonProviderModels(
   const queued = modelsJsonWriteTail.then(run);
   modelsJsonWriteTail = queued.then(() => undefined, () => undefined);
   return queued;
+}
+
+
+const MODELS_JSON_OPTIONAL_PROVIDER_FIELDS = ["name", "apiKey", "headers", "authHeader", "compat", "modelOverrides"] as const;
+
+/** Provider fields Pi can load without this extension. Credential values stay as configured references. */
+function modelsJsonProviderRegistration(spec: AutoProviderSpec): { fields: JsonObject; remove: string[] } {
+  const fields: JsonObject = {
+    api: spec.api,
+    baseUrl: spec.baseUrl,
+  };
+  if (typeof spec.name === "string") fields.name = spec.name;
+  if (typeof spec.apiKey === "string") fields.apiKey = spec.apiKey;
+  if (spec.headers) fields.headers = spec.headers;
+  if (spec.authHeader !== undefined) fields.authHeader = spec.authHeader;
+  if (spec.compat) fields.compat = spec.compat;
+  if (spec.modelOverrides !== undefined) fields.modelOverrides = spec.modelOverrides;
+  return {
+    fields,
+    remove: MODELS_JSON_OPTIONAL_PROVIDER_FIELDS.filter((key) => fields[key] === undefined),
+  };
 }
 
 /** Read generated static models only; provider selection always comes from auto-provider.json. */
@@ -381,13 +385,14 @@ async function withModelsJsonLock<T>(path: string, fn: () => Promise<T>): Promis
   }
 }
 
-function cloneGeneratedMetadata(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((entry) => cloneGeneratedMetadata(entry));
+function cloneGeneratedMetadata(value: unknown, options: { preserveSecrets?: boolean } = {}): unknown {
+  if (Array.isArray(value)) return value.map((entry) => cloneGeneratedMetadata(entry, options));
   if (isObject(value)) {
     const result: JsonObject = {};
     for (const [key, entry] of Object.entries(value)) {
-      if (["apikey", "auth", "credential", "password", "secret", "token"].includes(key.toLowerCase())) continue;
-      result[key] = cloneGeneratedMetadata(entry);
+      const lowered = key.toLowerCase();
+      if (!options.preserveSecrets && ["apikey", "auth", "credential", "password", "secret", "token"].includes(lowered)) continue;
+      result[key] = cloneGeneratedMetadata(entry, options);
     }
     return result;
   }

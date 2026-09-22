@@ -37,17 +37,20 @@ the directory selected by `PI_CODING_AGENT_DIR`):
 - `$$` and `$!` for literal dollar and exclamation characters
 - any other string as a literal
 
-The extension does not print configured credential values or write them to generated
-model definitions.
+The extension does not print configured credential values. Generated **model** entries omit
+credentials; the provider entry copies configured `apiKey`, `authHeader`, `headers`, and `name`
+references so Pi can load the same catalog without this extension (for example subagents that
+start with `--no-extensions`).
 
 ## Refresh and restore
 
 Run `/refresh-models` to query each configured provider's `/v1/models` endpoint and
 enrich the returned ids with model metadata. A successful refresh replaces that
-provider's `models` array in `models.json`. Provider-level `api`, `baseUrl`, and
-configured compatibility are written once; model entries contain only non-default
-metadata such as names, capabilities, limits, costs, and necessary compatibility data.
-Default values are omitted and restored when the catalog is loaded.
+provider's `models` array in `models.json` and writes the same provider registration Pi needs
+without this extension: `api`, `baseUrl`, configured `apiKey` / `authHeader` / `headers` /
+`name` / `compat`. Model entries contain only non-default metadata such as names, capabilities,
+limits, costs, and necessary compatibility data. Default values are omitted and restored when
+the catalog is loaded.
 Stale models are removed from that provider's array. Other providers and unrelated
 provider fields are preserved.
 
